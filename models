@@ -1,0 +1,441 @@
+import math
+import torch
+import torch.nn as nn
+from torch.nn import init
+import torch.nn.functional as F
+import torch.autograd
+
+BATCHNORM_TRACK_RUNNING_STATS = False
+BATCHNORM_MOVING_AVERAGE_DECAY = 0.9997
+
+
+
+class GroupBatchnorm2d(nn.Module):
+    def __init__(self, c_num: int,
+                 group_num: int = 16,
+                 eps: float = 1e-10
+                 ):
+        super(GroupBatchnorm2d, self).__init__()
+        assert c_num >= group_num
+        self.group_num = group_num
+        self.weight = nn.Parameter(torch.randn(c_num, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(c_num, 1, 1))
+        self.eps = eps
+
+    def forward(self, x):
+        N, C, H, W = x.size()
+        x = x.view(N, self.group_num, -1)
+        mean = x.mean(dim=2, keepdim=True)
+        std = x.std(dim=2, keepdim=True)
+        x = (x - mean) / (std + self.eps)
+        x = x.view(N, C, H, W)
+        return x * self.weight + self.bias
+
+
+class SRU(nn.Module):
+    def __init__(self,
+                 oup_channels: int,
+                 group_num: int = 16,
+                 gate_treshold: float = 0.5,
+                 torch_gn: bool = True
+                 ):
+        super().__init__()
+
+        self.gn = nn.GroupNorm(num_channels=oup_channels, num_groups=group_num) if torch_gn else GroupBatchnorm2d(
+            c_num=oup_channels, group_num=group_num)
+        self.gate_treshold = gate_treshold
+        self.sigomid = nn.Sigmoid()
+
+    def forward(self, x):
+        gn_x = self.gn(x)
+        w_gamma = self.gn.weight / sum(self.gn.weight)
+        w_gamma = w_gamma.view(1, -1, 1, 1)
+        reweigts = self.sigomid(gn_x * w_gamma)
+        # Gate
+        w1 = torch.where(reweigts > self.gate_treshold, torch.ones_like(reweigts), reweigts)  # 大于门限值的设为1，否则保留原值
+        w2 = torch.where(reweigts > self.gate_treshold, torch.zeros_like(reweigts), reweigts)  # 大于门限值的设为0，否则保留原值
+        x_1 = w1 * x
+        x_2 = w2 * x
+        y = self.reconstruct(x_1, x_2)
+        return y
+
+    def reconstruct(self, x_1, x_2):
+        x_11, x_12 = torch.split(x_1, x_1.size(1) // 2, dim=1)
+        x_21, x_22 = torch.split(x_2, x_2.size(1) // 2, dim=1)
+        return torch.cat([x_11 + x_22, x_12 + x_21], dim=1)
+
+
+class CRU(nn.Module):
+    '''
+    alpha: 0<alpha<1
+    '''
+
+    def __init__(self,
+                 op_channel: int,
+                 alpha: float = 1 / 2,
+                 squeeze_radio: int = 2,
+                 group_size: int = 2,
+                 group_kernel_size: int = 3,
+                 ):
+        super().__init__()
+        self.up_channel = up_channel = int(alpha * op_channel)
+        self.low_channel = low_channel = op_channel - up_channel
+        self.squeeze1 = nn.Conv2d(up_channel, up_channel // squeeze_radio, kernel_size=1, bias=False)
+        self.squeeze2 = nn.Conv2d(low_channel, low_channel // squeeze_radio, kernel_size=1, bias=False)
+        # up
+        self.GWC = nn.Conv2d(up_channel // squeeze_radio, op_channel, kernel_size=group_kernel_size, stride=1,
+                             padding=group_kernel_size // 2, groups=group_size)
+        self.PWC1 = nn.Conv2d(up_channel // squeeze_radio, op_channel, kernel_size=1, bias=False)
+        # low
+        self.PWC2 = nn.Conv2d(low_channel // squeeze_radio, op_channel - low_channel // squeeze_radio, kernel_size=1,
+                              bias=False)
+        self.advavg = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x):
+        # Split
+        up, low = torch.split(x, [self.up_channel, self.low_channel], dim=1)
+        up, low = self.squeeze1(up), self.squeeze2(low)
+        # Transform
+        Y1 = self.GWC(up) + self.PWC1(up)
+        Y2 = torch.cat([self.PWC2(low), low], dim=1)
+        # Fuse
+        out = torch.cat([Y1, Y2], dim=1)
+        out = F.softmax(self.advavg(out), dim=1) * out
+        out1, out2 = torch.split(out, out.size(1) // 2, dim=1)
+        return out1 + out2
+
+
+class ScConv(nn.Module):
+    def __init__(self,
+                 op_channel: int,
+                 group_num: int = 4,
+                 gate_treshold: float = 0.5,
+                 alpha: float = 1 / 2,
+                 squeeze_radio: int = 2,
+                 group_size: int = 2,
+                 group_kernel_size: int = 3,
+                 ):
+        super().__init__()
+        self.SRU = SRU(op_channel,
+                       group_num=group_num,
+                       gate_treshold=gate_treshold)
+        self.CRU = CRU(op_channel,
+                       alpha=alpha,
+                       squeeze_radio=squeeze_radio,
+                       group_size=group_size,
+                       group_kernel_size=group_kernel_size)
+
+    def forward(self, x):
+        x = self.SRU(x)
+        x = self.CRU(x)
+        return x
+
+
+class BNorm_init(nn.BatchNorm2d):
+    def reset_parameters(self):
+        init.uniform_(self.weight, 0, 1)
+        init.zeros_(self.bias)
+
+
+class Conv2d_init(nn.Conv2d):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode="zeros"):
+        super(Conv2d_init, self).__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias, padding_mode)
+
+    def reset_parameters(self):
+        init.xavier_normal_(self.weight)
+        if self.bias is not None:
+            fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in)
+            init.uniform_(self.bias, -bound, bound)
+
+
+class Conv1x1(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(Conv1x1, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+def _conv_block(in_chanels, out_chanels, kernel_size, padding):
+    return nn.Sequential(Conv2d_init(in_channels=in_chanels, out_channels=out_chanels,
+                                     kernel_size=kernel_size, padding=padding, bias=False),
+                         FeatureNorm(num_features=out_chanels, eps=0.001),
+                         nn.ReLU())
+
+
+class FeatureNorm(nn.Module):
+    def __init__(self, num_features, feature_index=1, rank=4, reduce_dims=(2, 3), eps=0.001, include_bias=True):
+        super(FeatureNorm, self).__init__()
+        self.shape = [1] * rank
+        self.shape[feature_index] = num_features
+        self.reduce_dims = reduce_dims
+
+        self.scale = nn.Parameter(torch.ones(self.shape, requires_grad=True, dtype=torch.float))
+        self.bias = nn.Parameter(torch.zeros(self.shape, requires_grad=True, dtype=torch.float)) if include_bias else nn.Parameter(
+            torch.zeros(self.shape, requires_grad=False, dtype=torch.float))
+
+        self.eps = eps
+
+    def forward(self, features):
+        f_std = torch.std(features, dim=self.reduce_dims, keepdim=True)
+        f_mean = torch.mean(features, dim=self.reduce_dims, keepdim=True)
+        return self.scale * ((features - f_mean) / (f_std + self.eps).sqrt()) + self.bias
+
+
+class SpatialAttention(nn.Module):
+    # 初始化，卷积核大小为7*7
+    def __init__(self, kernel_size=7):
+        # 继承父类初始化方法
+        super(SpatialAttention, self).__init__()
+
+        # 为了保持卷积前后的特征图shape相同，卷积时需要padding
+        padding = kernel_size // 2
+        # 7*7卷积融合通道信息 [b,2,h,w]==>[b,1,h,w]
+        self.conv = nn.Conv2d(in_channels=4, out_channels=1, kernel_size=kernel_size,
+                              padding=padding, bias=False)
+        # sigmoid函数
+        self.sigmoid = nn.Sigmoid()
+
+    # 前向传播
+    def forward(self, inputs1, inputs2):
+        # 在通道维度上最大池化 [b,1,h,w]  keepdim保留原有深度
+        # 返回值是在某维度的最大值和对应的索引
+        x_maxpool1, _ = torch.max(inputs1, dim=1, keepdim=True)
+        x_maxpool2, _ = torch.max(inputs2, dim=1, keepdim=True)
+
+        # 在通道维度上平均池化 [b,1,h,w]
+        x_avgpool1 = torch.mean(inputs1, dim=1, keepdim=True)
+        x_avgpool2 = torch.mean(inputs2, dim=1, keepdim=True)
+        # 池化后的结果在通道维度上堆叠 [b,2,h,w]
+        x = torch.cat([x_maxpool1, x_maxpool2, x_avgpool1, x_avgpool2], dim=1)
+
+        # 卷积融合通道信息 [b,2,h,w]==>[b,1,h,w]
+        x = self.conv(x)
+        # 空间权重归一化
+        x = self.sigmoid(x)
+        # 输入特征图和空间权重相乘
+        outputs = inputs2 * x + inputs1 * (1 - x)
+        return outputs
+
+class ASPP(nn.Module):
+    def __init__(self, in_channel, depth):
+        super(ASPP, self).__init__()
+        self.mean = nn.AdaptiveAvgPool2d((1, 1))  # (1,1)means ouput_dim
+        self.conv = nn.Conv2d(in_channel, depth, 1, 1)
+        self.atrous_block1 = nn.Conv2d(in_channel, depth, 1, 1)
+        self.atrous_block6 = nn.Conv2d(in_channel, depth, 3, 1, padding=6, dilation=6)
+        self.atrous_block12 = nn.Conv2d(in_channel, depth, 3, 1, padding=12, dilation=12)
+        self.atrous_block18 = nn.Conv2d(in_channel, depth, 3, 1, padding=18, dilation=18)
+        self.conv_1x1_output = nn.Conv2d(depth * 5, depth, 1, 1)
+
+    def forward(self, x):
+        size = x.shape[2:]
+
+        image_features = self.mean(x)
+        image_features = self.conv(image_features)
+        image_features = F.upsample(image_features, size=size, mode='bilinear')
+
+        atrous_block1 = self.atrous_block1(x)
+        atrous_block6 = self.atrous_block6(x)
+        atrous_block12 = self.atrous_block12(x)
+        atrous_block18 = self.atrous_block18(x)
+
+        net = self.conv_1x1_output(torch.cat([image_features, atrous_block1, atrous_block6,
+                                              atrous_block12, atrous_block18], dim=1))
+        return net
+
+class MSDANet(nn.Module):
+    def __init__(self, device, input_width, input_height, input_channels):
+        super(MSDANet, self).__init__()
+        if input_width % 8 != 0 or input_height % 8 != 0:
+            raise Exception(f"Input size must be divisible by 8! width={input_width}, height={input_height}")
+        self.input_width = input_width
+        self.input_height = input_height
+        self.input_channels = input_channels
+
+
+        self.conv1 = _conv_block(self.input_channels,32, 5, 2)#512
+        self.maxp1 = nn.MaxPool2d(2)                          #256
+        self.conv2 = _conv_block(32, 64, 5, 2)
+        self.conv3 = _conv_block(64, 64, 5, 2)
+        self.conv4 = _conv_block(64, 64, 5, 2)
+        # self.ScConv1 = ScConv(64)
+        self.maxp2 = nn.MaxPool2d(2)                          #128
+        self.conv5 = _conv_block(64, 64, 5, 2)
+        self.conv6 = _conv_block(64, 64, 5, 2)                                 #32+64+64+64+1024+1024
+        self.conv7 = _conv_block(64, 64, 5, 2)
+        self.conv8 = _conv_block(64, 64, 5, 2)
+        # self.ScConv2 = ScConv(64)
+        self.maxp3 = nn.MaxPool2d(2)                          #64
+        self.conv9 = _conv_block(64, 1024, 15, 7)
+        self.conv9a = _conv_block(1024, 1024, 5, 2)
+
+        self.upsa3 = nn.Upsample(scale_factor=2,
+                                 mode='bilinear')
+        #self.upsa3 = nn.functional.interpolate(self.conv9a, scale_factor=2, mode='nearest')  #128
+        self.conv6a = _conv_block(1024, 64, 5, 2)
+        self.upsa2 = nn.Upsample(scale_factor=2,
+                                 mode='bilinear')
+        #self.upsa2 = nn.functional.interpolate(self.conv6a, scale_factor=2, mode='nearest') #256
+        self.conv3a = _conv_block(64, 64, 5, 2)
+        self.upsa1 = nn.Upsample(scale_factor=2,
+                                 mode='bilinear')
+        #self.upsa1 = nn.functional.interpolate(self.conv3a, scale_factor=2, mode='nearest')  #512
+        self.conv1a = _conv_block(64, 32, 5, 2)
+
+        self.conv_concat1 = _conv_block(65, 65, 5, 2)
+        self.conv_concat1s = _conv_block(65, 32, 5, 2)
+        self.conv_concat2 = _conv_block(65, 65, 5, 2)
+        self.conv_concat3 = _conv_block(130, 130, 5, 2)
+        self.conv_concat3s = _conv_block(130, 64, 5, 2)
+        self.conv_concat4 = _conv_block(1025, 1025, 5, 2)
+        self.conv_concat5 = _conv_block(1155, 1024, 5, 2)
+        self.conv_concat5s = _conv_block(1024, 128, 5, 2)
+        self.seg_mask1 = nn.Sequential(
+            Conv2d_init(in_channels=1024, out_channels=1, kernel_size=1, padding=0, bias=False),
+            FeatureNorm(num_features=1, eps=0.001, include_bias=False))
+
+        self.ASPP1 = ASPP(1024, 1024)
+        self.ASPP2 = ASPP(64, 64)
+        self.ASPP3 = ASPP(64, 64)
+        self.ASPP4 = ASPP(32, 32)
+        # self.extractor = nn.Sequential(nn.MaxPool2d(kernel_size=2),
+        #                                _conv_block(in_chanels=1185, out_chanels=8, kernel_size=5, padding=2),
+        #                                nn.MaxPool2d(kernel_size=2),
+        #                                _conv_block(in_chanels=8, out_chanels=16, kernel_size=5, padding=2),
+        #                                nn.MaxPool2d(kernel_size=2),
+        #                                _conv_block(in_chanels=16, out_chanels=32, kernel_size=5, padding=2))
+        self.maxpool1 = nn.MaxPool2d(kernel_size=2)
+        self.ASPPS1 = ASPP(1185,1024)
+        self.ScConv1 = ScConv(1024)
+        self.convs7 = _conv_block(in_chanels=1024, out_chanels=64, kernel_size=5, padding=2)
+        self.convs8 = _conv_block(in_chanels=64, out_chanels=8, kernel_size=5, padding=2)
+
+        self.convs1 = _conv_block(in_chanels=1185, out_chanels=8, kernel_size=5, padding=2)
+        # self.ScConv1 = ScConv(1024)
+        self.maxpool2 = nn.MaxPool2d(kernel_size=2)
+        self.convs2 = _conv_block(in_chanels=8, out_chanels=16, kernel_size=5, padding=2)
+        # self.ScConvs1 = ScConv(8)
+        self.maxpool3 = nn.MaxPool2d(kernel_size=2)
+        self.convs3 = _conv_block(in_chanels=16, out_chanels=32, kernel_size=5, padding=2)
+        self.convs4 = _conv_block(in_chanels=40, out_chanels=32, kernel_size=5, padding=2)
+        # self.convs5 = _conv_block(in_chanels=32, out_chanels=16, kernel_size=5, padding=2)
+        # self.convs6 = _conv_block(in_chanels=64, out_chanels=32, kernel_size=5, padding=2)
+
+        self.global_max_pool_feat = nn.MaxPool2d(kernel_size=32)
+        self.global_avg_pool_feat = nn.AvgPool2d(kernel_size=32)
+        self.global_max_pool_seg = nn.MaxPool2d(kernel_size=(self.input_height / 8, self.input_width / 8))
+        self.global_avg_pool_seg = nn.AvgPool2d(kernel_size=(self.input_height / 8, self.input_width / 8))
+
+        self.fc = nn.Linear(in_features=66, out_features=1)
+
+        self.volume_lr_multiplier_layer = GradientMultiplyLayer().apply
+        self.glob_max_lr_multiplier_layer = GradientMultiplyLayer().apply
+        self.glob_avg_lr_multiplier_layer = GradientMultiplyLayer().apply
+
+        self.device = device
+
+        self.spatial_attention = SpatialAttention()
+
+    def set_gradient_multipliers(self, multiplier):
+        self.volume_lr_multiplier_mask = (torch.ones((1,)) * multiplier).to(self.device)
+        self.glob_max_lr_multiplier_mask = (torch.ones((1,)) * multiplier).to(self.device)
+        self.glob_avg_lr_multiplier_mask = (torch.ones((1,)) * multiplier).to(self.device)
+
+    def forward(self, input):
+        x1 = self.conv1(input)
+        x2 = self.maxp1(x1)
+        x3 = self.conv2(x2)
+        x4 = self.conv3(x3)
+        x5 = self.conv4(x4)
+        x6 = self.maxp2(x5)
+        x7 = self.conv5(x6)
+        x8 = self.conv6(x7)
+        x9 = self.conv7(x8)
+        x10 = self.conv8(x9)
+        x11 = self.maxp3(x10)
+        x12 = self.conv9(x11)
+        x13 = self.conv9a(x12)
+        x14 = self.upsa3(x13)
+        x15 = self.conv6a(x14)
+        x16 = self.upsa2(x15)
+        x17 = self.conv3a(x16)
+        x18 = self.upsa1(x17)
+        x19 = self.conv1a(x18)
+
+        seg_mask1 = self.seg_mask1(x13)
+
+        x13 = self.ASPP1(x13)
+        x15 = self.ASPP2(x15)
+        x17 = self.ASPP3(x17)
+        x19 = self.ASPP4(x19)
+        concat1 = self.spatial_attention(inputs1=x13, inputs2=x12)
+        concat2 = self.spatial_attention(inputs1=x15, inputs2=x6)
+        concat3 = self.spatial_attention(inputs1=x17, inputs2=x4)
+        concat4 = self.spatial_attention(inputs1=x19, inputs2=x1)
+
+        concat4 = nn.functional.interpolate(concat4, scale_factor=0.5, mode='bilinear', align_corners=False)
+        concats1 = torch.cat((concat4, concat3), dim=1)
+        concats1 = nn.functional.interpolate(concats1, scale_factor=0.5, mode='bilinear', align_corners=False)
+        concats1 = torch.cat((concats1, concat2), dim=1)
+        concats1 = nn.functional.interpolate(concats1, scale_factor=0.5, mode='bilinear', align_corners=False)
+        concats1 = torch.cat((concats1, concat1), dim=1)
+        cat = torch.cat([concats1, seg_mask1], dim=1)
+        # cat = torch.cat([x12, seg_mask1], dim=1)
+        cat = self.volume_lr_multiplier_layer(cat, self.volume_lr_multiplier_mask)
+        # features = self.extractor(cat)
+        x1s = self.maxpool1(cat)
+        x7s = self.ASPPS1(x1s)
+        x8s = self.ScConv1(x7s)
+        x8s = self.convs7(x8s)
+        x8s = self.convs8(x8s)
+        x8s = nn.functional.interpolate(x8s, scale_factor=0.25, mode='bilinear', align_corners=False)
+        x2s = self.convs1(x1s)
+        # x2s = self.ScConv1(x1s)
+        x3s = self.maxpool2(x2s)
+        x4s = self.convs2(x3s)
+        # x4s = self.ScConvs1(x3s)
+        x5s= self.maxpool3(x4s)
+        x6s = self.convs3(x5s)
+
+        features = torch.cat((x6s, x8s), dim=1)
+
+        features = self.convs4(features)
+        # features = self.convs5(features)
+        # features = self.convs6(features)
+
+        global_max_feat = torch.max(torch.max(features, dim=-1, keepdim=True)[0], dim=-2, keepdim=True)[0]
+
+        global_avg_feat = torch.mean(features, dim=(-1, -2), keepdim=True)
+        global_max_seg1 = torch.max(torch.max(seg_mask1, dim=-1, keepdim=True)[0], dim=-2, keepdim=True)[0]
+        global_avg_seg1 = torch.mean(seg_mask1, dim=(-1, -2), keepdim=True)
+
+        global_max_feat = global_max_feat.reshape(global_max_feat.size(0), -1)
+
+        global_avg_feat = global_avg_feat.reshape(global_avg_feat.size(0), -1)
+
+        global_max_seg1 = global_max_seg1.reshape(global_max_seg1.size(0), -1)
+        global_max_seg1 = self.glob_max_lr_multiplier_layer(global_max_seg1, self.glob_max_lr_multiplier_mask)
+
+        global_avg_seg1 = global_avg_seg1.reshape(global_avg_seg1.size(0), -1)
+        global_avg_seg1 = self.glob_avg_lr_multiplier_layer(global_avg_seg1, self.glob_avg_lr_multiplier_mask)
+
+        fc_in = torch.cat([global_max_feat, global_avg_feat, global_max_seg1, global_avg_seg1], dim=1)
+
+        fc_in = fc_in.reshape(fc_in.size(0), -1)
+        prediction = self.fc(fc_in)
+        return prediction, seg_mask1
+
+
+class GradientMultiplyLayer(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, mask_bw):
+        ctx.save_for_backward(mask_bw)
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        mask_bw, = ctx.saved_tensors
+        return grad_output.mul(mask_bw), None
