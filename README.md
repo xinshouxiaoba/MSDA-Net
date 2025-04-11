@@ -1,5 +1,5 @@
-# paper
-MSDA-Net
+#MSDA-Net
+Enhancing Multi-Scale Learning with Dual-Path Adaptive Feature Fusion for Mixed-Supervised Industrial Defect Detection
 
 ## How to run:
 
